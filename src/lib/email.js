@@ -49,3 +49,52 @@ export async function sendBookingConfirmationEmail(booking, toEmail) {
     console.error('Failed to send booking confirmation email:', err.message);
   }
 }
+
+function escapeHtml(text) {
+  if (typeof text !== 'string') return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Convert plain text to safe HTML (escape + newlines to <br>). */
+export function plainTextToHtml(text) {
+  const escaped = escapeHtml(text);
+  const withBreaks = escaped.replace(/\n/g, '<br>');
+  return `<div style="font-family: system-ui, sans-serif; max-width: 560px; line-height: 1.5;">${withBreaks}</div>`;
+}
+
+/**
+ * Send the same email (subject + html body) to multiple recipients.
+ * @param {string[]} toEmails - List of email addresses
+ * @param {string} subject - Email subject
+ * @param {string} htmlBody - HTML body (already safe)
+ * @returns {{ sent: number, failed: number }}
+ */
+export async function sendBulkEmail(toEmails, subject, htmlBody) {
+  const transporter = getTransporter();
+  if (!transporter) {
+    throw new Error('SMTP not configured (SMTP_HOST, SMTP_USER, SMTP_PASS in .env)');
+  }
+  const from = process.env.MAIL_FROM || process.env.SMTP_USER;
+  const uniqueEmails = [...new Set(toEmails)].filter((e) => e && typeof e === 'string' && e.includes('@'));
+  let sent = 0;
+  let failed = 0;
+  for (const to of uniqueEmails) {
+    try {
+      await transporter.sendMail({
+        from: from || 'noreply@rideronin.com',
+        to,
+        subject,
+        html: htmlBody,
+      });
+      sent++;
+    } catch (err) {
+      console.error(`Bulk email failed for ${to}:`, err.message);
+      failed++;
+    }
+  }
+  return { sent, failed };
+}

@@ -4,6 +4,7 @@ import { requireAuthOrAdmin } from '../middleware/auth.js';
 import { loadProfile } from '../middleware/profile.js';
 import { requireAdmin } from '../middleware/admin.js';
 import { supabaseAdmin } from '../supabase.js';
+import { sendBulkEmail, plainTextToHtml } from '../lib/email.js';
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
@@ -103,3 +104,41 @@ slotTemplatesRouter.delete('/:time', async (req, res) => {
 });
 
 adminRouter.use('/slot-templates', slotTemplatesRouter);
+
+adminRouter.post('/send-email', requireAuthOrAdmin, loadProfile, requireAdmin, async (req, res) => {
+  const { subject, body } = req.body;
+  if (!subject || typeof subject !== 'string' || !subject.trim()) {
+    return res.status(400).json({ error: 'subject is required' });
+  }
+  if (!body || typeof body !== 'string') {
+    return res.status(400).json({ error: 'body is required' });
+  }
+  const emails = [];
+  const perPage = 1000;
+  let page = 1;
+  let hasMore = true;
+  while (hasMore) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({
+      page,
+      perPage,
+    });
+    if (error) return res.status(500).json({ error: error.message });
+    const users = data?.users ?? [];
+    for (const u of users) {
+      if (u.email) emails.push(u.email);
+    }
+    hasMore = users.length === perPage;
+    page += 1;
+  }
+  const uniqueEmails = [...new Set(emails)];
+  if (uniqueEmails.length === 0) {
+    return res.json({ sent: 0, failed: 0, total: 0, message: 'No user emails found in auth' });
+  }
+  const htmlBody = plainTextToHtml(body.trim());
+  try {
+    const { sent, failed } = await sendBulkEmail(uniqueEmails, subject.trim(), htmlBody);
+    res.json({ sent, failed, total: uniqueEmails.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to send emails' });
+  }
+});

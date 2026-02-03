@@ -37,6 +37,59 @@ function verifyPaymentSignature(orderId, paymentId, signature) {
   return expected === signature;
 }
 
+/**
+ * Call Razorpay refund API. Amount in paise (omit for full refund).
+ * Returns true if refund was initiated.
+ */
+async function refundPayment(razorpay, paymentId, amountPaise, options = {}) {
+  if (!razorpay || !paymentId) return false;
+  try {
+    const body = {
+      speed: 'normal',
+      notes: {
+        reason: options.reason || 'booking_failed',
+        ...(options.notes || {}),
+      },
+      receipt: options.receipt || `refund_${Date.now()}`,
+    };
+    if (amountPaise != null && amountPaise > 0) {
+      body.amount = amountPaise;
+    }
+    await razorpay.payments.refund(paymentId, body);
+    return true;
+  } catch (err) {
+    console.error('Razorpay refund failed:', err.message || err);
+    return false;
+  }
+}
+
+/** Insert a refund_pending booking so POST /refund can find it by payment_id + user_id. */
+async function insertRefundPendingBooking({
+  userId,
+  paymentId,
+  amountRupees,
+  date,
+  slotTime,
+  slotDisplayTime,
+  userName,
+  userEmail,
+  userPhone,
+}) {
+  const { error } = await supabaseAdmin.from('bookings').insert({
+    user_id: userId,
+    date,
+    slot_time: slotTime,
+    slot_display_time: slotDisplayTime ?? null,
+    status: 'refund_pending',
+    payment_id: paymentId,
+    amount: amountRupees,
+    user_name: userName,
+    user_email: userEmail,
+    user_phone: userPhone || null,
+  });
+  if (error) console.error('Insert refund_pending booking failed:', error.message);
+}
+
 export const paymentsRouter = Router();
 
 paymentsRouter.post('/create-order', requireAuth, loadProfile, async (req, res) => {
@@ -124,6 +177,19 @@ paymentsRouter.post('/verify', requireAuth, loadProfile, async (req, res) => {
   const template = templates.find((t) => t.time === slotTime);
   const capacity = override?.capacity ?? template?.capacity ?? 2;
 
+  const amountRupees = Math.round(orderAmountPaise / 100);
+  const refundPendingPayload = {
+    userId: req.userId,
+    paymentId: razorpay_payment_id,
+    amountRupees,
+    date,
+    slotTime,
+    slotDisplayTime,
+    userName: profile.name,
+    userEmail: profile.email,
+    userPhone: profile.phone || null,
+  };
+
   const { count } = await supabaseAdmin
     .from('bookings')
     .select('*', { count: 'exact', head: true })
@@ -131,7 +197,16 @@ paymentsRouter.post('/verify', requireAuth, loadProfile, async (req, res) => {
     .eq('slot_time', slotTime)
     .eq('status', 'confirmed');
   if (count >= capacity) {
-    return res.status(400).json({ error: 'Slot is fully booked' });
+    await insertRefundPendingBooking(refundPendingPayload);
+    await refundPayment(razorpay, razorpay_payment_id, orderAmountPaise, {
+      reason: 'slot_full',
+      receipt: `refund_slot_full_${date}_${slotTime}`,
+    });
+    return res.status(400).json({
+      error: 'Slot is fully booked. Your payment has been refunded.',
+      code: 'BOOKING_FAILED_REFUND_PENDING',
+      refundInitiated: true,
+    });
   }
 
   const { data: dup } = await supabaseAdmin
@@ -142,9 +217,18 @@ paymentsRouter.post('/verify', requireAuth, loadProfile, async (req, res) => {
     .eq('user_id', req.userId)
     .eq('status', 'confirmed')
     .maybeSingle();
-  if (dup) return res.status(400).json({ error: 'You have already booked this slot' });
-
-  const amountRupees = Math.round(orderAmountPaise / 100);
+  if (dup) {
+    await insertRefundPendingBooking(refundPendingPayload);
+    await refundPayment(razorpay, razorpay_payment_id, orderAmountPaise, {
+      reason: 'duplicate_booking',
+      receipt: `refund_dup_${date}_${slotTime}`,
+    });
+    return res.status(400).json({
+      error: 'You have already booked this slot. Your payment has been refunded.',
+      code: 'BOOKING_FAILED_REFUND_PENDING',
+      refundInitiated: true,
+    });
+  }
 
   const { data: inserted, error } = await supabaseAdmin
     .from('bookings')
@@ -163,11 +247,87 @@ paymentsRouter.post('/verify', requireAuth, loadProfile, async (req, res) => {
     .select()
     .single();
 
-  if (error) return res.status(400).json({ error: error.message });
+  if (error) {
+    await insertRefundPendingBooking(refundPendingPayload);
+    await refundPayment(razorpay, razorpay_payment_id, orderAmountPaise, {
+      reason: 'booking_insert_failed',
+      notes: { db_error: error.message?.slice(0, 100) },
+      receipt: `refund_err_${Date.now()}`,
+    });
+    return res.status(400).json({
+      error: 'Booking could not be completed. Your payment has been refunded.',
+      code: 'BOOKING_FAILED_REFUND_PENDING',
+      refundInitiated: true,
+    });
+  }
 
   sendBookingConfirmationEmail(inserted, profile.email).catch((err) =>
     console.error('Booking email failed:', err.message)
   );
 
   res.json(mapBooking(inserted));
+});
+
+paymentsRouter.post('/refund', requireAuth, async (req, res) => {
+  const razorpay = getRazorpay();
+  if (!razorpay) {
+    return res.status(503).json({ error: 'Payments not configured' });
+  }
+  const { payment_id, amount } = req.body;
+  if (!payment_id || typeof payment_id !== 'string') {
+    return res.status(400).json({ error: 'payment_id is required' });
+  }
+
+  const { data: booking } = await supabaseAdmin
+    .from('bookings')
+    .select('id, payment_id, amount, status')
+    .eq('payment_id', payment_id)
+    .eq('user_id', req.userId)
+    .maybeSingle();
+  if (!booking) {
+    return res.status(404).json({ error: 'Booking not found or you cannot refund this payment' });
+  }
+  if (booking.status !== 'refund_pending' && booking.status !== 'confirmed') {
+    return res.status(400).json({ error: 'This booking cannot be refunded' });
+  }
+
+  const amountPaise = amount != null
+    ? Math.round((typeof amount === 'number' ? amount : Number(amount)) * 100)
+    : null;
+  if (amountPaise != null && (Number.isNaN(amountPaise) || amountPaise <= 0)) {
+    return res.status(400).json({ error: 'Invalid amount' });
+  }
+
+  try {
+    const refund = await razorpay.payments.refund(
+      payment_id,
+      amountPaise != null ? { amount: amountPaise } : {}
+    );
+    console.log('Razorpay refund:', refund);
+    await supabaseAdmin
+      .from('bookings')
+      .update({
+        status: 'refund_pending',
+        payment_id: refund.payment_id,
+      })
+      .eq('id', booking.id);
+    return res.json({ ok: true, refundId: refund.id, amount: refund.amount });
+  } catch (err) {
+    const msg = (err.error?.description || err.message || '').toLowerCase();
+    const alreadyRefunded =
+      msg.includes('fully refunded') || msg.includes('already refunded') || msg.includes('refunded already');
+    if (alreadyRefunded) {
+      await supabaseAdmin
+        .from('bookings')
+        .update({
+          status: 'cancelled',
+          cancelled_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', booking.id);
+      return res.json({ ok: true, alreadyRefunded: true });
+    }
+    console.error('Razorpay refund failed:', err);
+    return res.status(400).json({ error: err.error?.description || err.message || 'Refund failed' });
+  }
 });

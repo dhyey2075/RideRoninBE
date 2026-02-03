@@ -31,24 +31,25 @@ slotsRouter.get('/:date', async (req, res) => {
     ? templatesRes.data
     : DEFAULT_SLOTS.map((s, i) => ({ ...s, display_time: s.displayTime, sort_order: i }));
 
-  const overrideMap = new Map((overridesRes.data ?? []).map((r) => [r.time, r.capacity]));
+  const templateByTime = new Map(templates.map((t) => [t.time, t]));
+  const overrides = overridesRes.data ?? [];
   const bookedBySlot = new Map();
   (bookingsRes.data ?? []).forEach((r) => bookedBySlot.set(r.slot_time, (bookedBySlot.get(r.slot_time) ?? 0) + 1));
 
-  const slots = templates.map((t) => {
-    const time = t.time;
-    const capacity = overrideMap.get(time) ?? t.capacity ?? 2;
-    const booked = bookedBySlot.get(time) ?? 0;
+  const slots = overrides.map((r) => {
+    const t = templateByTime.get(r.time);
     return {
-      id: `${date}-${time}`,
-      time,
-      displayTime: t.display_time ?? t.displayTime ?? time,
-      capacity,
-      booked,
+      id: `${date}-${r.time}`,
+      time: r.time,
+      displayTime: t?.display_time ?? t?.displayTime ?? r.time,
+      capacity: r.capacity ?? 2,
+      booked: bookedBySlot.get(r.time) ?? 0,
+      sortOrder: t?.sort_order ?? 999,
     };
   });
-
-  res.json(slots);
+  slots.sort((a, b) => a.sortOrder - b.sortOrder);
+  const result = slots.map(({ sortOrder: _, ...s }) => s);
+  res.json(result);
 });
 
 slotsRouter.put('/:date/:time', requireAuthOrAdmin, loadProfile, requireAdmin, async (req, res) => {
@@ -63,4 +64,12 @@ slotsRouter.put('/:date/:time', requireAuthOrAdmin, loadProfile, requireAdmin, a
   );
   if (error) return res.status(400).json({ error: error.message });
   res.json({ date, time, capacity });
+});
+
+slotsRouter.delete('/:date/:time', requireAuthOrAdmin, loadProfile, requireAdmin, async (req, res) => {
+  const date = req.params.date;
+  const time = decodeURIComponent(req.params.time);
+  const { error } = await supabaseAdmin.from('date_slot_overrides').delete().eq('date', date).eq('time', time);
+  if (error) return res.status(400).json({ error: error.message });
+  res.status(204).send();
 });
